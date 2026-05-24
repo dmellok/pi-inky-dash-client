@@ -1,4 +1,4 @@
-# Inky Dash Listener
+# Pi Inky Dash Client
 
 The Raspberry Pi side of [Inky Dash](https://github.com/dmellok/inky-dash) — a small MQTT daemon that listens for render jobs and paints them onto a [Pimoroni Inky Impression](https://shop.pimoroni.com/products/inky-impression-7-3) e-ink panel.
 
@@ -23,8 +23,8 @@ You can run this without the companion — anything that can publish JSON to MQT
 ## Install
 
 ```bash
-git clone https://github.com/dmellok/inky-dash-listener.git
-cd inky-dash-listener
+git clone https://github.com/dmellok/pi-inky-dash-client.git
+cd pi-inky-dash-client
 sudo ./install.sh
 ```
 
