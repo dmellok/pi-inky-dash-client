@@ -21,19 +21,32 @@ Configuration precedence (later wins):
 
 Environment variables:
     MQTT_BROKER, MQTT_PORT, MQTT_USER, MQTT_PASSWORD,
-    MQTT_TOPIC, MQTT_STATUS_TOPIC, MQTT_CLIENT_ID, MQTT_TLS, LOG_LEVEL,
+    MQTT_TOPIC, MQTT_BIN_TOPIC, MQTT_STATUS_TOPIC, MQTT_CLIENT_ID,
+    MQTT_TLS, LOG_LEVEL,
     INKY_RENDERER  (path to inky_render.py; default: alongside this file)
     INKY_RENDER_TIMEOUT  (seconds; default 120)
 
 Job payload (JSON published to MQTT_TOPIC, default `inky/update`):
     {
         "url":        "https://example.com/photo.jpg",   // OR
-        "path":       "/home/kayden/images/photo.jpg",
+        "path":       "/home/kayden/images/photo.jpg",   // OR
+        "bin":        "/home/kayden/images/photo.bin",
         "rotate":     0 | 90 | 180 | 270,
         "scale":      "fit" | "fill" | "stretch" | "center",
         "bg":         "white" | "black" | "red" | "green" | "blue" | "yellow" | "orange",
         "saturation": 0.0 - 1.0
     }
+
+The `bin` form is a pre-quantized, panel-ready buffer (960_000 bytes;
+see inky_render.render_raw_bin for the exact layout) that bypasses
+PIL/quantization entirely. When `bin` is set, rotate/scale/bg/saturation
+are ignored. The value may be a local path or an http(s):// URL.
+
+Bin-only shortcut topic (MQTT_BIN_TOPIC, default `inky/bin`):
+    The payload is a single http(s):// URL string (no JSON wrapper);
+    the daemon translates it into a `{"bin": "<url>"}` job for the
+    same renderer. Use this when your server already produces panel-
+    ready bins and just wants to push them.
 
 Status payload (JSON, retained on MQTT_STATUS_TOPIC, default `inky/status`):
     {"state": "idle",      "ts": "...", "last_url": "...", "last_result": "ok",
@@ -143,7 +156,7 @@ def display_worker(renderer_path, renderer_timeout, job_queue, stop_event, statu
         except queue.Empty:
             continue
 
-        url = job.get("url") or job.get("path") or "?"
+        url = job.get("url") or job.get("path") or job.get("bin") or "?"
         started = time.monotonic()
         status.publish_rendering(url)
 
@@ -218,9 +231,9 @@ def make_mqtt_client(args, job_queue):
 
     def on_connect(c, _userdata, _flags, rc):
         if rc == 0:
-            log.info("Connected to MQTT %s:%d, subscribing to %s",
-                     args.broker, args.port, args.topic)
-            c.subscribe(args.topic, qos=1)
+            log.info("Connected to MQTT %s:%d, subscribing to %s and %s",
+                     args.broker, args.port, args.topic, args.bin_topic)
+            c.subscribe([(args.topic, 1), (args.bin_topic, 1)])
             # Initial idle status; status object is attached to the client
             # by main() before the loop starts.
             status = getattr(c, "_status", None)
@@ -238,10 +251,13 @@ def make_mqtt_client(args, job_queue):
         log.debug("Message on %s: %s", msg.topic, raw)
 
         if not raw:
-            log.warning("Empty payload, ignoring")
+            log.warning("Empty payload on %s, ignoring", msg.topic)
             return
 
-        if raw.startswith("{"):
+        if msg.topic == args.bin_topic:
+            # Bin-only topic: payload is a single http(s):// URL string.
+            job = {"bin": raw}
+        elif raw.startswith("{"):
             try:
                 job = json.loads(raw)
             except json.JSONDecodeError as e:
@@ -254,12 +270,13 @@ def make_mqtt_client(args, job_queue):
         else:
             job = {"url" if "://" in raw else "path": raw}
 
-        if not (job.get("url") or job.get("path")):
-            log.error("Payload missing 'url' or 'path' field")
+        if not (job.get("url") or job.get("path") or job.get("bin")):
+            log.error("Payload missing 'url', 'path', or 'bin' field")
             return
 
         job_queue.put(job)
-        log.info("Queued job (queue depth: %d)", job_queue.qsize())
+        log.info("Queued job from %s (queue depth: %d)",
+                 msg.topic, job_queue.qsize())
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
@@ -289,7 +306,13 @@ def build_parser():
     parser.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"),
                         help="MQTT password (env: MQTT_PASSWORD)")
     parser.add_argument("--topic", default=os.environ.get("MQTT_TOPIC", "inky/update"),
-                        help="Topic to subscribe to for jobs (env: MQTT_TOPIC)")
+                        help="Topic to subscribe to for JSON render jobs "
+                             "(env: MQTT_TOPIC)")
+    parser.add_argument("--bin-topic",
+                        default=os.environ.get("MQTT_BIN_TOPIC", "inky/bin"),
+                        help="Topic to subscribe to for bin-URL render jobs; "
+                             "payload is a single http(s):// URL "
+                             "(env: MQTT_BIN_TOPIC)")
     parser.add_argument("--status-topic",
                         default=os.environ.get("MQTT_STATUS_TOPIC", "inky/status"),
                         help="Topic to publish state to (env: MQTT_STATUS_TOPIC)")

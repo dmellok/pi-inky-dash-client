@@ -12,15 +12,19 @@ panel after many consecutive calls.
 Stdin payload (JSON object, identical to the MQTT contract):
     {
         "url":        "https://example.com/photo.jpg",   // OR
-        "path":       "/home/kayden/images/photo.jpg",
+        "path":       "/home/kayden/images/photo.jpg",   // OR
+        "bin":        "/home/kayden/images/photo.bin"        // OR an
+                                                              // http(s):// URL
         "rotate":     0 | 90 | 180 | 270,
         "scale":      "fit" | "fill" | "stretch" | "center",
         "bg":         "white" | "black" | "red" | "green" | "blue" | "yellow" | "orange",
         "saturation": 0.0 - 1.0
     }
 
-All fields except url/path are optional. Logs go to stderr so the parent
-can forward them to the journal.
+All fields except url/path/bin are optional. `bin` is a pre-quantized,
+panel-ready buffer (see RAW_BUF_BYTES below); when set, the image-
+processing fields (rotate/scale/bg/saturation) are ignored. Logs go to
+stderr so the parent can forward them to the journal.
 
 Exit codes:
     0  rendered and shown successfully
@@ -38,6 +42,13 @@ from PIL import Image, ImageOps
 
 
 WIDTH, HEIGHT = 1600, 1200
+
+# Size of a pre-quantized panel-ready buffer: 1600*1200 pixels at 4 bits
+# each = 960_000 bytes. The first half goes to CS0 (left columns) and the
+# second to CS1 (right columns); see render_raw_bin() for the layout the
+# upstream tool must produce.
+RAW_BUF_BYTES = (WIDTH * HEIGHT) // 2
+RAW_HALF_BYTES = RAW_BUF_BYTES // 2
 
 # Hard cap on input pixel count. Anything bigger gets rejected before we
 # try to decode it into RGB and OOM the Pi. A 100MP RGB image is roughly
@@ -141,6 +152,55 @@ def prepare_image(img, target_size, scale, rotation, bg_color):
     raise ValueError(f"Unknown scale type: {scale}")
 
 
+def _load_bin_bytes(source):
+    """Read a panel-ready buffer from either a local path or http(s) URL."""
+    parsed = urlparse(source)
+    if parsed.scheme in ("http", "https"):
+        log.info("Fetching bin from %s", source)
+        resp = requests.get(source, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.content
+
+    log.info("Loading bin from %s", source)
+    with open(source, "rb") as f:
+        return f.read()
+
+
+def render_raw_bin(source, inky):
+    """Push a pre-quantized panel-ready buffer to the display.
+
+    `source` is either a local filesystem path or an http(s):// URL.
+    The upstream tool must produce bytes in the exact layout the
+    EL133UF1 expects on the wire:
+
+        1. Start with a (height=1200, width=1600) array of palette
+           indices (0..6) — the 6-colour Spectra palette, with 4
+           reserved/unused.
+        2. numpy.rot90(buf, -1) → shape (1600, 1200).
+        3. Split column-wise at col 600: left half (1600, 600) and
+           right half (1600, 600), flatten each in row-major order.
+        4. Pack consecutive index pairs into nibbles:
+               byte = ((a << 4) & 0xF0) | (b & 0x0F)
+           giving two 480_000-byte buffers.
+        5. Concatenate: left half first (CS0), right half second (CS1).
+
+    Total: 960_000 bytes. Any other size is rejected.
+    """
+    data = _load_bin_bytes(source)
+    if len(data) != RAW_BUF_BYTES:
+        raise ValueError(
+            f"Bin from {source} is {len(data)} bytes; expected "
+            f"{RAW_BUF_BYTES} (1600x1200 4-bit packed)."
+        )
+
+    buf_a = list(data[:RAW_HALF_BYTES])
+    buf_b = list(data[RAW_HALF_BYTES:])
+
+    log.info("Pushing %d bytes (panel-ready) to %dx%d display",
+             len(data), inky.width, inky.height)
+    inky._update(buf_a, buf_b)
+
+
 def parse_options(opts):
     rotate = int(opts.get("rotate", DEFAULTS["rotate"]))
     if rotate not in VALID_ROTATIONS:
@@ -183,15 +243,10 @@ def main():
         log.error("Job must be a JSON object, got %s", type(job).__name__)
         sys.exit(1)
 
+    bin_path = job.get("bin")
     source = job.get("url") or job.get("path")
-    if not source:
-        log.error("Job missing 'url' or 'path' field")
-        sys.exit(1)
-
-    try:
-        rotate, scale, bg, saturation = parse_options(job)
-    except (ValueError, TypeError) as e:
-        log.error("Invalid options: %s", e)
+    if not bin_path and not source:
+        log.error("Job missing 'url', 'path', or 'bin' field")
         sys.exit(1)
 
     # Import inky lazily — we want to bail out cleanly on bad input
@@ -204,19 +259,27 @@ def main():
 
     try:
         inky = auto(ask_user=False, verbose=False)
-        target = (inky.width, inky.height)
         log.info("Panel detected: %s %dx%d",
                  type(inky).__name__, inky.width, inky.height)
 
-        img = fetch_image(source)
-        prepared = prepare_image(img, target, scale, rotate, BG_COLORS[bg])
+        if bin_path:
+            render_raw_bin(bin_path, inky)
+        else:
+            try:
+                rotate, scale, bg, saturation = parse_options(job)
+            except (ValueError, TypeError) as e:
+                log.error("Invalid options: %s", e)
+                sys.exit(1)
 
-        log.info(
-            "Rendering (rotate=%d, scale=%s, bg=%s, saturation=%.2f)",
-            rotate, scale, bg, saturation,
-        )
-        inky.set_image(prepared, saturation=saturation)
-        inky.show()
+            img = fetch_image(source)
+            prepared = prepare_image(img, (inky.width, inky.height),
+                                     scale, rotate, BG_COLORS[bg])
+            log.info(
+                "Rendering (rotate=%d, scale=%s, bg=%s, saturation=%.2f)",
+                rotate, scale, bg, saturation,
+            )
+            inky.set_image(prepared, saturation=saturation)
+            inky.show()
         log.info("Render complete")
     except Exception:
         log.exception("Render failed")
