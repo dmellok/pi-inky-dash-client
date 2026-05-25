@@ -2,9 +2,14 @@
 
 The Raspberry Pi side of [Inky Dash](https://github.com/dmellok/inky-dash) — a small MQTT daemon that listens for render jobs and paints them onto a [Pimoroni Inky Impression](https://shop.pimoroni.com/products/inky-impression-7-3) e-ink panel.
 
-It subscribes to `inky/update`, fetches the image referenced in each job (URL or local path), prepares it for the panel, and pushes it to the display. Live render state is published back to `inky/status` as a retained message so the companion web app can show "rendering / idle / offline" without polling.
+It subscribes to two topics:
 
-You can run this without the companion — anything that can publish JSON to MQTT can drive the panel.
+- **`inky/update`** — JSON render jobs (URL / local path / pre-quantized bin file). The daemon fetches the image, prepares it for the panel, and pushes it to the display.
+- **`inky/bin`** — a shortcut for servers that already produce panel-ready bins. Payload is a single `http(s)://` URL pointing at a 960KB pre-quantized buffer; the daemon downloads it and pushes the bytes straight to SPI, skipping PIL and quantization.
+
+Live render state is published back to `inky/status` as a retained message so the companion web app can show "rendering / idle / offline" without polling.
+
+You can run this without the companion — anything that can publish to MQTT can drive the panel.
 
 ## What's in the box
 
@@ -47,6 +52,10 @@ For a non-interactive install, copy `.env.example` to `/etc/inky-mqtt/.env` and 
 mosquitto_pub -h <broker> -t inky/update \
   -m '{"url":"https://picsum.photos/1600/1200","scale":"fill"}'
 
+# Or if your server already produces panel-ready bins:
+mosquitto_pub -h <broker> -t inky/bin \
+  -m 'https://your-server/dash/latest.bin'
+
 # Watch live state:
 mosquitto_sub -h <broker> -t inky/status -v
 ```
@@ -60,7 +69,8 @@ If everything's wired up you should see a `rendering` message immediately, then 
 ```jsonc
 {
   "url":        "https://example.com/photo.jpg",   // or
-  "path":       "/home/pi/images/photo.jpg",
+  "path":       "/home/pi/images/photo.jpg",       // or
+  "bin":        "https://example.com/photo.bin",   // local path also accepted
   "rotate":     0,        // 0 | 90 | 180 | 270
   "scale":      "fit",    // fit | fill | stretch | center
   "bg":         "white",  // white | black | red | green | blue | yellow | orange
@@ -68,7 +78,29 @@ If everything's wired up you should see a `rendering` message immediately, then 
 }
 ```
 
-Only `url` *or* `path` is required. The listener also accepts a bare URL or path string for convenience — anything that doesn't start with `{` is treated as a single-source job.
+Exactly one of `url`, `path`, or `bin` is required. The `bin` form points at a pre-quantized, panel-ready buffer (see below); when set, `rotate` / `scale` / `bg` / `saturation` are ignored. The listener also accepts a bare URL or path string for convenience — anything that doesn't start with `{` is treated as a single-source `url`/`path` job.
+
+### Bin shortcut — published to `inky/bin`
+
+```
+https://your-server/dash/latest.bin
+```
+
+The payload is the URL itself, with no JSON wrapper. The daemon translates it into a `{"bin": "<url>"}` job for the same renderer. Use this when your server already produces panel-ready bins and just wants to push them.
+
+The daemon also accepts a full JSON `{"bin": "<url>"}` payload on `inky/bin` (and any other JSON job shape) — useful if your MQTT plumbing always emits JSON.
+
+### Bin file format
+
+A pre-quantized buffer is **exactly 960,000 bytes** — the bytes the EL133UF1 controller takes on the wire. Layout:
+
+1. Start with a `(height=1200, width=1600)` array of 4-bit palette indices (Spectra 6: `0=black 1=white 2=yellow 3=red 5=blue 6=green`, with 4 reserved).
+2. `numpy.rot90(buf, -1)` → shape `(1600, 1200)`.
+3. Split column-wise at col 600: left half `(1600, 600)` and right half `(1600, 600)`, each flattened in row-major order.
+4. Pack consecutive index pairs into nibbles: `byte = ((a << 4) & 0xF0) | (b & 0x0F)` → two 480,000-byte halves.
+5. Concatenate: left half first (sent to CS0), right half second (sent to CS1). Total **960,000 bytes**.
+
+Any other size is rejected. See `inky_render.render_raw_bin()` for the reference implementation on the receive side.
 
 ### Status payload — retained on `inky/status`
 
@@ -98,7 +130,8 @@ Only `url` *or* `path` is required. The listener also accepts a bare URL or path
 | `MQTT_PORT` | `1883` | Broker port |
 | `MQTT_USER` | — | Optional username |
 | `MQTT_PASSWORD` | — | Optional password |
-| `MQTT_TOPIC` | `inky/update` | Job topic the listener subscribes to |
+| `MQTT_TOPIC` | `inky/update` | JSON job topic the listener subscribes to |
+| `MQTT_BIN_TOPIC` | `inky/bin` | Bin-URL shortcut topic (payload is a single URL string) |
 | `MQTT_STATUS_TOPIC` | `inky/status` | State topic the listener publishes on (retained) |
 | `MQTT_CLIENT_ID` | `inky-impression-<pid>` | MQTT client ID |
 | `MQTT_TLS` | `false` | Enable TLS (`paho.tls_set()` with system CA roots) |

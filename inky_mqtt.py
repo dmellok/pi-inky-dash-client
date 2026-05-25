@@ -254,10 +254,8 @@ def make_mqtt_client(args, job_queue):
             log.warning("Empty payload on %s, ignoring", msg.topic)
             return
 
-        if msg.topic == args.bin_topic:
-            # Bin-only topic: payload is a single http(s):// URL string.
-            job = {"bin": raw}
-        elif raw.startswith("{"):
+        if raw.startswith("{"):
+            # JSON on either topic — full job contract.
             try:
                 job = json.loads(raw)
             except json.JSONDecodeError as e:
@@ -267,6 +265,9 @@ def make_mqtt_client(args, job_queue):
                 log.error("JSON payload must be an object, got %s",
                           type(job).__name__)
                 return
+        elif msg.topic == args.bin_topic:
+            # Bin topic, bare string: treat as URL/path to a panel-ready bin.
+            job = {"bin": raw}
         else:
             job = {"url" if "://" in raw else "path": raw}
 
